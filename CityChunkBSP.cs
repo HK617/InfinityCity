@@ -13,10 +13,9 @@ public class CityChunkBSP : IDisposable
     public int tilesPerFrame = 1500;
 
     [Header("Prefabs")]
-    public GameObject wayPrefab;         // Layer=Way 推奨
+    public GameObject wayPrefab;         // Layer=Way 推奨（MeshRenderer か Collider が必要）
     public GameObject blockPrefab;       // 区画のベース（任意）
-    [Tooltip("Lot内にランダム配置する建物プレハブ（元サイズのまま）")]
-    public GameObject[] buildingPrefabs; // ★追加：3種類などを登録
+    public GameObject[] buildingPrefabs; // 3種などを登録（元スケールのまま）
 
     [Header("Visual Fill")]
     [Range(0.1f, 1f)] public float wayTileFillXZ = 1.0f;
@@ -24,27 +23,35 @@ public class CityChunkBSP : IDisposable
     [Range(0.1f, 1f)] public float blockFillXZ = 0.90f;
     [Range(0.05f, 3f)] public float blockFillY = 1.20f;
 
-    [Header("Road Generation (BSP + Global Arterials)")]
-    [Tooltip("グローバル幹線の間隔（世界座標セル）。境界が必ず繋がる")]
-    public int globalArterialPeriod = 8;  // ★追加：チャンク継ぎ目の道路整合
-    [Range(1, 3)]
-    public int globalArterialWidth = 1;  // 幅
-    [Tooltip("BSP分割の最小サイズ。小さいほど道が増える (0=自動)")]
-    public int minPartitionSize = 0;
-    [Range(0f, 1f)]
-    public float extraCrossChance = 0.35f;
-    [Range(0, 3)]
-    public int extraCrossWidth = 1;
+    [Header("Road Generation (Global+Random BSP)")]
+    public int globalArterialPeriod = 8;
+    [Range(1, 3)] public int globalArterialWidth = 1;
+    public int minPartitionSize = 0;          // 0=自動（chunkTiles/6）
+    [Range(0f, 1f)] public float extraCrossChance = 0.35f;
+    [Range(0, 3)] public int extraCrossWidth = 1;
 
-    [Header("Lots (空き地区画)")]
-    public bool placeLotBaseBlock = true;  // ベースの大ブロックを置くか
+    [Header("Lots / Buildings Packing")]
+    public bool placeLotBaseBlock = true;
     public int minLotAreaCells = 3;
     public bool mergeDiagonals = false;
-    [Tooltip("Lotあたりの建物数 [min,max]")]
-    public Vector2Int buildingsPerLot = new Vector2Int(1, 3); // ★追加
+
+    [Tooltip("Lot を建物の元サイズでグリッド敷きする（等間隔・整列）")]
+    public bool packBuildingsInGrid = true;
+
+    [Tooltip("グリッド間の余白（ワールド単位）")]
+    public float buildingGridPadding = 0.5f;
+
+    [Tooltip("Lot の外周マージン（建物が道にはみ出さない余白）")]
+    public float lotEdgeMargin = 0.5f;
+
+    [Tooltip("Lot あたりの建物最大数（安全上限）")]
+    public int maxBuildingsPerLot = 200;
+
+    [Tooltip("敷いた建物を静的化＋（可能なら）合体して軽量化")]
+    public bool staticCombinePerLot = true;
 
     [Header("Ground Sampling")]
-    public LayerMask groundMask = 0;
+    public LayerMask groundMask = 0;     // 0=地形なし（高速）
 
     [Header("NavMesh (Runtime)")]
     public bool bakeNavMeshPerChunk = true;
@@ -57,7 +64,6 @@ public class CityChunkBSP : IDisposable
     public Vector2Int chunkIndex;
     GameObject container;
 
-    // NavMesh
     NavMeshData navData;
     NavMeshDataInstance navInstance;
     AsyncOperation navOp;
@@ -88,20 +94,18 @@ public class CityChunkBSP : IDisposable
 
     public IEnumerator GenerateAsync()
     {
-        // 1) グローバル幹線（継ぎ目が必ず揃う）
+        // 1) 境界連続の幹線 → 2) BSPランダム道
         CarveGlobalArterials();
-
-        // 2) その上でBSP風にランダム道路を追加
         CarveRoadsBspStyle();
 
         // 3) 道タイル配置
         yield return StampWaysCoroutine();
 
-        // 4) 空き地→区画、区画中央にベースブロック＆建物を配置
+        // 4) 空き地→区画、区画ベースと Buildings 敷き詰め
         var lots = BuildLotsFromRemaining(touchesWayOnly: true);
         yield return StampLotsAndBuildingsCoroutine(lots);
 
-        // 5) 道レイヤーだけ NavMesh（チャンク境界を少しはみ出すバウンズ）
+        // 5) NavMesh（Wayのみ／メッシュ→無ければコライダー収集）
         if (bakeNavMeshPerChunk) BuildChunkNavMeshAsync();
     }
 
@@ -111,7 +115,7 @@ public class CityChunkBSP : IDisposable
         if (container != null) UnityEngine.Object.Destroy(container);
     }
 
-    // ====== 道：グローバル幹線 ======
+    // ====== 道：幹線（世界座標で period を共有 → チャンク継ぎ目連続） ======
     void CarveGlobalArterials()
     {
         for (int x = 0; x < chunkTiles; x++)
@@ -121,17 +125,16 @@ public class CityChunkBSP : IDisposable
         int period = Mathf.Max(1, globalArterialPeriod);
         int width = Mathf.Clamp(globalArterialWidth, 1, 3);
 
-        // 世界セル座標（チャンクまたぎで同一の行列になる）
         for (int lx = 0; lx < chunkTiles; lx++)
         {
             int wxCell = WorldCellX(lx);
-            if (Mathf.Abs(Mod(wxCell, period)) == 0)
+            if (Mod(wxCell, period) == 0)
                 CarveV(0, chunkTiles, lx, width);
         }
         for (int lz = 0; lz < chunkTiles; lz++)
         {
             int wzCell = WorldCellZ(lz);
-            if (Mathf.Abs(Mod(wzCell, period)) == 0)
+            if (Mod(wzCell, period) == 0)
                 CarveH(0, chunkTiles, lz, width);
         }
     }
@@ -154,7 +157,6 @@ public class CityChunkBSP : IDisposable
 
             if (!canSplitH && !canSplitV)
             {
-                // ランダムに1本
                 if (rng.NextDouble() < 0.5 && r.height >= 3)
                     CarveH(r.xMin, r.xMax, rng.Next(r.yMin + 1, r.yMax - 1), 1);
                 else if (r.width >= 3)
@@ -179,7 +181,7 @@ public class CityChunkBSP : IDisposable
             }
         }
 
-        // ランダム交差を追加
+        // 交差の追加
         int extra = Mathf.Max(1, chunkTiles / 3);
         for (int i = 0; i < extra; i++)
         {
@@ -193,7 +195,6 @@ public class CityChunkBSP : IDisposable
         }
     }
 
-    // carve helpers
     void CarveH(int xMin, int xMax, int z, int width)
     {
         int half = Mathf.Max(0, (width - 1) / 2);
@@ -245,7 +246,7 @@ public class CityChunkBSP : IDisposable
             }
     }
 
-    // ====== 区画化＋建物配置 ======
+    // ====== 区画化＋建物（グリッド敷き詰め） ======
     struct Lot { public List<Vector2Int> cells; public int minX, minZ, maxX, maxZ; public bool touchesWay; }
 
     List<Lot> BuildLotsFromRemaining(bool touchesWayOnly)
@@ -314,88 +315,175 @@ public class CityChunkBSP : IDisposable
 
         foreach (var lot in lots)
         {
-            int wCells = lot.maxX - lot.minX + 1;
-            int hCells = lot.maxZ - lot.minZ + 1;
+            // Lotの外接矩形（ワールド）
+            float lotMinX = OriginX + lot.minX * cellSize + lotEdgeMargin;
+            float lotMaxX = OriginX + (lot.maxX + 1) * cellSize - lotEdgeMargin;
+            float lotMinZ = OriginZ + lot.minZ * cellSize + lotEdgeMargin;
+            float lotMaxZ = OriginZ + (lot.maxZ + 1) * cellSize - lotEdgeMargin;
+            float lotW = Mathf.Max(0f, lotMaxX - lotMinX);
+            float lotD = Mathf.Max(0f, lotMaxZ - lotMinZ);
 
-            float cx = (lot.minX + lot.maxX + 1) * 0.5f;
-            float cz = (lot.minZ + lot.maxZ + 1) * 0.5f;
-            Vector3 wc = LocalToWorldCenterFloat(cx, cz);
-
-            float ground = SampleGroundY(wc.x, wc.z);
-
-            // 1) Lotベースブロック（任意）
-            if (placeLotBaseBlock && blockPrefab)
+            // 1) ベースブロック（敷地台座：任意）
+            if (placeLotBaseBlock && blockPrefab && lotW > 0f && lotD > 0f)
             {
-                float lotSizeX = wCells * cellSize;
-                float lotSizeZ = hCells * cellSize;
-
-                float sizeX = lotSizeX * Mathf.Clamp01(blockFillXZ);
-                float sizeZ = lotSizeZ * Mathf.Clamp01(blockFillXZ);
+                float sizeX = lotW * Mathf.Clamp01(blockFillXZ);
+                float sizeZ = lotD * Mathf.Clamp01(blockFillXZ);
                 float sizeY = cellSize * Mathf.Max(0.05f, blockFillY);
 
-                float yCenter = ground + sizeY * 0.5f;
-
+                Vector3 center = new Vector3((lotMinX + lotMaxX) * 0.5f, 0f, (lotMinZ + lotMaxZ) * 0.5f);
+                float ground = SampleGroundY(center.x, center.z);
                 var baseGo = UnityEngine.Object.Instantiate(
                     blockPrefab,
-                    new Vector3(wc.x, yCenter, wc.z),
+                    new Vector3(center.x, ground + sizeY * 0.5f, center.z),
                     Quaternion.identity,
                     container.transform
                 );
                 Fit(baseGo, sizeX, sizeY, sizeZ);
+                baseGo.isStatic = true;
             }
 
-            // 2) Building複数（元サイズのまま、回転だけ）
-            if (buildingPrefabs != null && buildingPrefabs.Length > 0)
+            // 2) Buildings を「元サイズのまま」グリッド敷き
+            if (buildingPrefabs != null && buildingPrefabs.Length > 0 && packBuildingsInGrid && lotW > 0f && lotD > 0f)
             {
-                int minB = Mathf.Max(0, buildingsPerLot.x);
-                int maxB = Mathf.Max(minB, buildingsPerLot.y);
-                int count = UnityEngine.Random.Range(minB, maxB + 1);
+                // 代表プレハブのフットプリント（XY=上下、XZ=平面）
+                Vector2 fp = EstimatePrefabFootprintXZ(buildingPrefabs[0]); // 代表値
+                // 代表値が小さすぎるとおかしくなるのでクランプ
+                fp.x = Mathf.Max(0.1f, fp.x);
+                fp.y = Mathf.Max(0.1f, fp.y);
 
-                for (int i = 0; i < count; i++)
+                float pitchX = fp.x + buildingGridPadding;
+                float pitchZ = fp.y + buildingGridPadding;
+
+                int cols = Mathf.FloorToInt(lotW / pitchX);
+                int rows = Mathf.FloorToInt(lotD / pitchZ);
+                cols = Mathf.Clamp(cols, 0, 512);
+                rows = Mathf.Clamp(rows, 0, 512);
+
+                int placed = 0;
+                // 左下基準の開始位置
+                float startX = (lotMinX + lotMaxX) * 0.5f - (cols * pitchX) * 0.5f + pitchX * 0.5f;
+                float startZ = (lotMinZ + lotMaxZ) * 0.5f - (rows * pitchZ) * 0.5f + pitchZ * 0.5f;
+
+                // まとめ用の親
+                GameObject lotGroup = new GameObject("BuildingsLot");
+                lotGroup.transform.SetParent(container.transform, false);
+                lotGroup.transform.position = new Vector3(OriginX, 0f, OriginZ);
+
+                for (int rz = 0; rz < rows; rz++)
                 {
-                    var prefab = buildingPrefabs[rng.Next(buildingPrefabs.Length)];
-                    if (!prefab) continue;
+                    for (int cx = 0; cx < cols; cx++)
+                    {
+                        if (placed >= maxBuildingsPerLot) break;
 
-                    // Lotの矩形内でランダム座標
-                    float rx = UnityEngine.Random.Range(lot.minX + 0.2f, lot.maxX + 0.8f);
-                    float rz = UnityEngine.Random.Range(lot.minZ + 0.2f, lot.maxZ + 0.8f);
-                    Vector3 pos = LocalToWorldCenterFloat(rx, rz);
+                        var prefab = buildingPrefabs[rng.Next(buildingPrefabs.Length)];
+                        if (!prefab) continue;
 
-                    float gy = SampleGroundY(pos.x, pos.z);
+                        float x = startX + cx * pitchX;
+                        float z = startZ + rz * pitchZ;
+                        float y = SampleGroundY(x, z);
 
-                    var b = UnityEngine.Object.Instantiate(
-                        prefab,
-                        new Vector3(pos.x, gy, pos.z),
-                        Quaternion.Euler(0f, UnityEngine.Random.Range(0f, 360f), 0f),
-                        container.transform
-                    );
-                    // ★スケールはいじらない（元サイズのまま）
+                        // 角度は固定（揃える）※90°回転に切替たい場合はここで Quaternion.Euler(0,90,0)
+                        var b = UnityEngine.Object.Instantiate(
+                            prefab,
+                            new Vector3(x, y, z),
+                            Quaternion.identity,
+                            lotGroup.transform
+                        );
+                        b.isStatic = staticCombinePerLot; // 後で合体するなら静的化
+
+                        placed++;
+                    }
+                    if (placed >= maxBuildingsPerLot) break;
                 }
+
+                // 軽量化：静的合体（可能な環境で）
+#if !UNITY_EDITOR
+                if (staticCombinePerLot) TryStaticCombine(lotGroup);
+#else
+                if (staticCombinePerLot) TryStaticCombine(lotGroup);
+#endif
             }
 
             if (--budget <= 0) { budget = tilesPerFrame; yield return null; }
         }
     }
 
-    // ====== NavMesh（Wayのみ / バウンズに余白） ======
+    // プレハブのXZフットプリント推定（Renderer合成）
+    Vector2 EstimatePrefabFootprintXZ(GameObject prefab)
+    {
+        var rs = prefab.GetComponentsInChildren<Renderer>(true);
+        if (rs.Length == 0) return new Vector2(1f, 1f);
+        Bounds b = rs[0].bounds;
+        for (int i = 1; i < rs.Length; i++) b.Encapsulate(rs[i].bounds);
+        return new Vector2(b.size.x, b.size.z);
+    }
+
+    void TryStaticCombine(GameObject groupRoot)
+    {
+        // MeshCombine（単純版）
+        var filters = groupRoot.GetComponentsInChildren<MeshFilter>();
+        if (filters.Length <= 1) return;
+
+        var combines = new List<CombineInstance>(filters.Length);
+        foreach (var mf in filters)
+        {
+            var mr = mf.GetComponent<MeshRenderer>();
+            if (!mf.sharedMesh || !mr) continue;
+            var ci = new CombineInstance
+            {
+                mesh = mf.sharedMesh,
+                transform = mf.transform.localToWorldMatrix
+            };
+            combines.Add(ci);
+            mr.enabled = false;
+        }
+
+        var combined = new GameObject("Combined");
+        combined.transform.SetParent(groupRoot.transform, false);
+        var mfCombined = combined.AddComponent<MeshFilter>();
+        var mrCombined = combined.AddComponent<MeshRenderer>();
+        var mesh = new Mesh { indexFormat = UnityEngine.Rendering.IndexFormat.UInt32 };
+        mesh.CombineMeshes(combines.ToArray(), true, true);
+        mfCombined.sharedMesh = mesh;
+        // マテリアルは適当に1つに（複数マテリアルを厳密保持するなら CombineMeshes(false,false) など別設計）
+        if (filters.Length > 0)
+        {
+            var mrs = filters[0].GetComponent<MeshRenderer>();
+            if (mrs) mrCombined.sharedMaterials = mrs.sharedMaterials;
+        }
+    }
+
+    // ====== NavMesh（Wayのみ、Mesh→無ければCollider収集、境界+1セル余白） ======
     void BuildChunkNavMeshAsync()
     {
-        // Wayが無ければ何もしない（Empty回避）
-        if (!AnyWay()) { navReady = false; return; }
+        navReady = false;
+
+        if (!AnyWay()) return;
 
         var sources = new List<NavMeshBuildSource>();
         var markups = new List<NavMeshBuildMarkup>();
         int wayMask = LayerMask.GetMask("Way");
 
+        // まず RenderMeshes で収集（道プレハブに MeshRenderer がある場合）
         NavMeshBuilder.CollectSources(
             container.transform,
             wayMask,
             NavMeshCollectGeometry.RenderMeshes,
-            0,
-            markups,
-            sources
+            0, markups, sources
         );
-        if (sources.Count == 0) { navReady = false; return; }
+
+        // メッシュが無ければ Collider で再収集（BoxCollider だけの道でもOKにする）
+        if (sources.Count == 0)
+        {
+            NavMeshBuilder.CollectSources(
+                container.transform,
+                wayMask,
+                NavMeshCollectGeometry.PhysicsColliders,
+                0, markups, sources
+            );
+        }
+
+        if (sources.Count == 0) return;
 
         var settings = NavMesh.GetSettingsByID(agentTypeId);
 
@@ -409,10 +497,8 @@ public class CityChunkBSP : IDisposable
         navData = new NavMeshData(settings.agentTypeID);
         navInstance = NavMesh.AddNavMeshData(navData);
 
-        navReady = false;
         navOp = NavMeshBuilder.UpdateNavMeshDataAsync(navData, settings, sources, bounds);
-        if (navOp != null)
-            navOp.completed += _ => { navReady = true; };
+        if (navOp != null) navOp.completed += _ => { navReady = true; };
     }
 
     // ====== 補助 ======
