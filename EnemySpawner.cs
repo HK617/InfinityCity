@@ -1,128 +1,109 @@
-// Assets/scripts/EnemySpawner.cs
 using System.Collections;
 using UnityEngine;
 using UnityEngine.AI;
 
 public class EnemySpawner : MonoBehaviour
 {
-    [Header("Spawn")]
-    public GameObject enemyPrefab;      // 敵プレハブ
-    public Transform player;            // 追尾対象（任意だが設定推奨）
-    public float spawn_interval = 3f;   // 何秒ごとに
-    public int spawn_number = 3;     // 一度に何体
-    public float minSpawnDistance = 3f; // プレイヤーに近すぎたら湧かさない距離
+    [Header("Refs")]
+    public Transform player;
+    public GameObject[] enemyPrefabs;
 
-    [Header("Area (XZ world)")]
-    public float minX = -200f, maxX = 200f;
-    public float minZ = -200f, maxZ = 200f;
+    [Header("Spawn Timing")]
+    public float spawnInterval = 2.0f;
 
-    [Header("NavMesh sampling")]
-    public float sampleMaxDistance = 50f; // ランダム点からNavMeshに吸着する許容半径
-    public int sampleTries = 30;  // 範囲内での試行回数
+    [Header("Distances")]
+    public float minSpawnDistance = 8f;
+    public float maxSpawnDistance = 25f;
 
-    [Header("Debug")]
-    public bool debugLogs = true;
+    [Header("Tries")]
+    public int triesPerRing = 16;
 
-    Coroutine loop;
-
-    void OnEnable()
+    void Start()
     {
-        if (loop == null) loop = StartCoroutine(SpawnLoop());
-    }
-
-    void OnDisable()
-    {
-        if (loop != null) StopCoroutine(loop);
-        loop = null;
+        if (player == null)
+        {
+            var playerObj = GameObject.FindGameObjectWithTag("Player");
+            player = playerObj ? playerObj.transform : FindObjectOfType<Transform>();
+        }
+        StartCoroutine(SpawnLoop());
     }
 
     IEnumerator SpawnLoop()
     {
-        if (enemyPrefab == null)
-        {
-            if (debugLogs) Debug.LogError("EnemySpawner: enemyPrefab 未設定");
-            yield break;
-        }
-
-        var wait = new WaitForSeconds(spawn_interval);
+        var wait = new WaitForSeconds(spawnInterval);
 
         while (true)
         {
-            for (int i = 0; i < spawn_number; i++)
+            var tri = NavMesh.CalculateTriangulation();
+            if (tri.vertices == null || tri.vertices.Length == 0)
             {
-                if (!TryGetNavmeshSpawn(out var pos))
-                {
-                    if (debugLogs) Debug.LogWarning("EnemySpawner: NavMesh 上のスポーン位置取得に失敗");
-                    continue;
-                }
-
-                // プレイヤーに近すぎる場合は一度だけ取り直す
-                if (player && Vector3.Distance(pos, player.position) < minSpawnDistance)
-                {
-                    if (!TryGetNavmeshSpawn(out pos)) continue;
-                    if (player && Vector3.Distance(pos, player.position) < minSpawnDistance) continue;
-                }
-
-                var go = Instantiate(enemyPrefab, pos, Quaternion.identity);
-                if (debugLogs) Debug.Log($"EnemySpawner: Spawned at {pos}");
-
-                // 索敵・視線判定付きのAIにターゲットを渡す（付けていれば）
-                var ai = go.GetComponent<EnemySenseChaseAgent>();
-                if (ai && player) ai.target = player;
+                Debug.LogWarning("EnemySpawner: NavMesh がまだ無いので待機");
+                yield return wait;
+                continue;
             }
+
+            Vector3 spawnPos;
+            bool ok = TryFindSpawnOnNavMesh(
+                player ? player.position : Vector3.zero,
+                minSpawnDistance, maxSpawnDistance,
+                triesPerRing, out spawnPos
+            );
+
+            if (!ok) ok = TryPickTriangleCentroid(tri, out spawnPos);
+
+            if (ok) SpawnEnemyAt(spawnPos);
+            else Debug.LogWarning("EnemySpawner: NavMesh 上のスポーン位置取得に失敗");
 
             yield return wait;
         }
     }
 
-    // --- NavMesh 上の地点を取得（範囲内を試行 → 失敗時はNavMesh全体から1点を選ぶ）---
-    bool TryGetNavmeshSpawn(out Vector3 result)
+    bool TryFindSpawnOnNavMesh(Vector3 center, float minR, float maxR, int tries, out Vector3 result)
     {
-        // 1) 指定範囲内で NavMesh に吸着
-        for (int t = 0; t < sampleTries; t++)
+        float r = Mathf.Max(1f, minR);
+
+        for (int step = 0; step < 3; step++)
         {
-            var rnd = new Vector3(Random.Range(minX, maxX), 100f, Random.Range(minZ, maxZ));
-            if (NavMesh.SamplePosition(rnd, out var hit, sampleMaxDistance, NavMesh.AllAreas))
+            for (int i = 0; i < tries; i++)
             {
-                result = hit.position;
-                return true;
+                Vector2 dir = Random.insideUnitCircle.normalized;
+                float d = Random.Range(r, maxR);
+                Vector3 p = new Vector3(center.x + dir.x * d, center.y + 5f, center.z + dir.y * d);
+
+                if (NavMesh.SamplePosition(p, out var hit, Mathf.Max(2f, r), NavMesh.AllAreas))
+                {
+                    result = hit.position;
+                    return true;
+                }
             }
+            r = Mathf.Min(maxR, r * 1.8f);
         }
 
-        // 2) フォールバック：NavMesh 全体の三角形から1点をランダムで取得
-        var tri = NavMesh.CalculateTriangulation();
-        if (tri.vertices != null && tri.vertices.Length >= 3 &&
-            tri.indices != null && tri.indices.Length >= 3)
-        {
-            int idx = Random.Range(0, tri.indices.Length / 3) * 3;
-            Vector3 a = tri.vertices[tri.indices[idx]];
-            Vector3 b = tri.vertices[tri.indices[idx + 1]];
-            Vector3 c = tri.vertices[tri.indices[idx + 2]];
-
-            // 三角形内部の一様乱数点（barycentric）
-            float r1 = Random.value;
-            float r2 = Random.value;
-            float s = Mathf.Sqrt(r1);
-            Vector3 p = (1 - s) * a + (s * (1 - r2)) * b + (s * r2) * c;
-
-            // 念のため近傍で吸着
-            if (NavMesh.SamplePosition(p + Vector3.up * 10f, out var hit2, 20f, NavMesh.AllAreas))
-            {
-                result = hit2.position;
-                return true;
-            }
-        }
-
-        result = default;
+        result = Vector3.zero;
         return false;
     }
 
-    // シーン上で範囲を可視化
-    void OnDrawGizmosSelected()
+    bool TryPickTriangleCentroid(NavMeshTriangulation tri, out Vector3 pos)
     {
-        Gizmos.color = Color.cyan;
-        var c = new Vector3((minX + maxX) * 0.5f, 0f, (minZ + maxZ) * 0.5f);
-        var s = new Vector3(Mathf.Abs(maxX - minX), 0.1f, Mathf.Abs(maxZ - minZ));
-        Gizmos.DrawWireCube(c, s);
+        if (tri.indices == null || tri.indices.Length < 3) { pos = Vector3.zero; return false; }
+
+        int triCount = tri.indices.Length / 3;
+        int t = Random.Range(0, triCount) * 3;
+
+        Vector3 a = tri.vertices[tri.indices[t]];
+        Vector3 b = tri.vertices[tri.indices[t + 1]];
+        Vector3 c = tri.vertices[tri.indices[t + 2]];
+
+        pos = (a + b + c) / 3f;
+        return true;
+    }
+
+    void SpawnEnemyAt(Vector3 position)
+    {
+        if (enemyPrefabs == null || enemyPrefabs.Length == 0) return;
+        var prefab = enemyPrefabs[Random.Range(0, enemyPrefabs.Length)];
+        if (!prefab) return;
+
+        Instantiate(prefab, position, Quaternion.identity);
     }
 }
