@@ -40,6 +40,16 @@ public class CityChunkBSP : IDisposable
     public int maxBuildingsPerLot = 200;
     public bool staticCombinePerLot = true;
 
+    [Header("Hole Coverage")]
+    public bool coverAllEmptyLots = true;        // 道に接していない領域もロット化して埋める
+    public bool fullCoverBaseBlocks = true;      // 台座ブロックでロット全面を覆う
+    [Range(0f, 0.05f)] public float baseBlockEdgeOverlap = 0.01f; // ほんの少しだけ重ねて隙間ゼロ化
+
+    [Header("Ultimate Hole Killer")]
+    public bool fallbackFillEveryEmptyCell = true;   // これが true なら空セルを薄板で必ず埋める
+    [Range(0.02f, 0.5f)] public float cellFillY = 0.10f; // 薄板の厚み（EffCell × この値）
+    [Range(0f, 0.05f)] public float cellFillOverlap = 0.01f; // XZをわずかに広げて隙間ゼロ化
+
     [Header("Connectors (Way ↔ Block)")]
     public bool ensureSidewalkConnectors = true;
     [Range(1, 3)] public int connectorWidthCells = 1;
@@ -112,12 +122,16 @@ public class CityChunkBSP : IDisposable
 
         yield return StampWaysCoroutine();
 
-        var lots = BuildLotsFromRemaining(touchesWayOnly: true);
+        var lots = BuildLotsFromRemaining(touchesWayOnly: false); // 既にfalse化済み
         yield return StampLotsAndBuildingsCoroutine(lots);
 
-        // ★ NavMesh 用の連続床を生成（これで 1タイルごとの切断を解消）
+        // ここで NavFloor を作る（既存）
         BuildContinuousNavFloor();
 
+        // 穴つぶしの最終フィル（新規）
+        yield return StampFallbackCellFill();
+
+        // その後にベイク
         if (bakeNavMeshPerChunk) BuildChunkNavMeshSync();
     }
 
@@ -318,10 +332,21 @@ public class CityChunkBSP : IDisposable
 
                 if (cells.Count < Mathf.Max(1, minLotAreaCells)) continue;
 
-                lots.Add(new Lot { cells = cells, minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ, touchesWay = touches });
+                lots.Add(new Lot
+                {
+                    cells = cells,
+                    minX = minX,
+                    maxX = maxX,
+                    minZ = minZ,
+                    maxZ = maxZ,
+                    touchesWay = touches
+                });
             }
 
-        lots.RemoveAll(l => !l.touchesWay);
+        // ★ ここを“条件付き”にする：coverAllEmptyLots が有効のときは削除しない
+        if (touchesWayOnly)
+            lots.RemoveAll(l => !l.touchesWay);
+
         return lots;
     }
 
@@ -337,17 +362,21 @@ public class CityChunkBSP : IDisposable
         {
             if (_disposed || parent == null) yield break;
 
-            float lotMinX = OriginX + lot.minX * EffCell + lotEdgeMargin;
-            float lotMaxX = OriginX + (lot.maxX + 1) * EffCell - lotEdgeMargin;
-            float lotMinZ = OriginZ + lot.minZ * EffCell + lotEdgeMargin;
-            float lotMaxZ = OriginZ + (lot.maxZ + 1) * EffCell - lotEdgeMargin;
+            // --- 台座ブロック生成部分（穴防止仕様） ---
+            float baseMargin = (fullCoverBaseBlocks ? 0f : lotEdgeMargin);
+            float lotMinX = OriginX + lot.minX * EffCell + baseMargin;
+            float lotMaxX = OriginX + (lot.maxX + 1) * EffCell - baseMargin;
+            float lotMinZ = OriginZ + lot.minZ * EffCell + baseMargin;
+            float lotMaxZ = OriginZ + (lot.maxZ + 1) * EffCell - baseMargin;
             float lotW = Mathf.Max(0f, lotMaxX - lotMinX);
             float lotD = Mathf.Max(0f, lotMaxZ - lotMinZ);
 
             if (placeLotBaseBlock && blockPrefab && lotW > 0f && lotD > 0f)
             {
-                float sizeX = lotW * Mathf.Clamp01(blockFillXZ);
-                float sizeZ = lotD * Mathf.Clamp01(blockFillXZ);
+                // わずかに重ねて隙間を消す（例：1% オーバー）
+                float over = Mathf.Clamp01(baseBlockEdgeOverlap);
+                float sizeX = lotW * (fullCoverBaseBlocks ? (1f + over) : Mathf.Clamp01(blockFillXZ));
+                float sizeZ = lotD * (fullCoverBaseBlocks ? (1f + over) : Mathf.Clamp01(blockFillXZ));
                 float sizeY = EffCell * Mathf.Max(0.05f, blockFillY);
 
                 Vector3 center = new Vector3((lotMinX + lotMaxX) * 0.5f, 0f, (lotMinZ + lotMaxZ) * 0.5f);
@@ -366,12 +395,17 @@ public class CityChunkBSP : IDisposable
                 }
             }
 
+
+            // 歩道コネクタ（任意）
             if (ensureSidewalkConnectors) AddLotSidewalkConnectors(lot);
 
+            // 建物敷き詰め（グリッド）
             if (buildingPrefabs != null && buildingPrefabs.Length > 0 && packBuildingsInGrid && lotW > 0f && lotD > 0f)
             {
+                // 代表プレハブからおおよその占有サイズを推定
                 Vector2 fp = EstimatePrefabFootprintXZ(buildingPrefabs[0]);
-                fp.x = Mathf.Max(0.1f, fp.x); fp.y = Mathf.Max(0.1f, fp.y);
+                fp.x = Mathf.Max(0.1f, fp.x);
+                fp.y = Mathf.Max(0.1f, fp.y);
 
                 float pitchX = fp.x + buildingGridPadding;
                 float pitchZ = fp.y + buildingGridPadding;
@@ -398,16 +432,40 @@ public class CityChunkBSP : IDisposable
 
                         float x = startX + cx * pitchX;
                         float z = startZ + rz * pitchZ;
-                        float y = SampleGroundY(x, z);
+                        float groundY = SampleGroundY(x, z);
 
+                        // いったん地面高さに生成
                         var b = UnityEngine.Object.Instantiate(
-                            prefab, new Vector3(x, y, z),
-                            Quaternion.identity, lotGroup.transform
+                            prefab,
+                            new Vector3(x, groundY, z),
+                            Quaternion.identity,
+                            lotGroup.transform
                         );
-                        if (b) b.isStatic = staticCombinePerLot;
+                        if (!b) continue;
+
+                        // === ここが重要：建物の「下端」を地面に合わせる ===
+                        // Renderer の Bounds を集約して下端オフセットを求め、原点でのズレを補正
+                        var renderers = b.GetComponentsInChildren<Renderer>(true);
+                        if (renderers != null && renderers.Length > 0)
+                        {
+                            Bounds bounds = renderers[0].bounds;
+                            for (int i = 1; i < renderers.Length; i++) bounds.Encapsulate(renderers[i].bounds);
+
+                            // 現在 position は建物のローカル原点 → bounds.min.y との差で上下補正量を算出
+                            float bottomOffset = bounds.min.y - b.transform.position.y;
+                            // 下端が groundY に一致するように移動
+                            b.transform.position = new Vector3(b.transform.position.x, b.transform.position.y - bottomOffset, b.transform.position.z);
+                        }
+
+                        // 必要に応じて微ランダムなヨー回転（街並みに変化）
+                        // ※ 回転が不都合ならコメントアウトしてください
+                        // b.transform.Rotate(0f, rng.Next(0, 4) * 90f, 0f, Space.World);
+
+                        b.isStatic = staticCombinePerLot;
 
                         placed++;
                     }
+
                     if (placed >= maxBuildingsPerLot) break;
                     if (--budget <= 0) { budget = tilesPerFrame; yield return null; }
                 }
@@ -416,6 +474,51 @@ public class CityChunkBSP : IDisposable
             }
 
             if (--budget <= 0) { budget = tilesPerFrame; yield return null; }
+        }
+    }
+
+    IEnumerator StampFallbackCellFill()
+    {
+        if (!fallbackFillEveryEmptyCell) yield break;
+        if (_disposed || container == null) yield break;
+
+        int budget = tilesPerFrame;
+        if (noYieldDuringStamp) budget = int.MaxValue;
+
+        var parent = container.transform;
+
+        float w = EffCell * (1f + Mathf.Clamp01(cellFillOverlap));
+        float d = EffCell * (1f + Mathf.Clamp01(cellFillOverlap));
+        float ySize = EffCell * Mathf.Max(0.02f, cellFillY);
+
+        for (int x = 0; x < chunkTiles; x++)
+        {
+            for (int z = 0; z < chunkTiles; z++)
+            {
+                if (_disposed || parent == null) yield break;
+
+                // 道セル以外（= Empty）は必ず薄板で埋める
+                if (grid[x, z] == CellType.Way) continue;
+
+                Vector3 c = LocalToWorldCenter(x, z);
+                float gy = SampleGroundY(c.x, c.z);
+                float yCenter = gy + ySize * 0.5f;
+
+                if (blockPrefab)
+                {
+                    var go = UnityEngine.Object.Instantiate(
+                        blockPrefab, new Vector3(c.x, yCenter, c.z),
+                        Quaternion.identity, parent
+                    );
+                    if (go)
+                    {
+                        Fit(go, w, ySize, d);
+                        go.isStatic = true;
+                    }
+                }
+
+                if (--budget <= 0) { budget = tilesPerFrame; yield return null; }
+            }
         }
     }
 
