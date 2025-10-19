@@ -15,8 +15,14 @@ public class EnemySpawner : MonoBehaviour
     public float minSpawnDistance = 8f;
     public float maxSpawnDistance = 25f;
 
+    [Header("NavMesh checks")]
+    public float navmeshCheckRadius = 100f;
+
     [Header("Tries")]
-    public int triesPerRing = 16;
+    public int triesPerRing = 24;
+
+    [Header("Debug")]
+    public bool verboseLog = false;
 
     void Start()
     {
@@ -35,50 +41,45 @@ public class EnemySpawner : MonoBehaviour
         while (true)
         {
             var tri = NavMesh.CalculateTriangulation();
-            if (tri.vertices == null || tri.vertices.Length == 0)
+            if (tri.vertices == null || tri.vertices.Length == 0) { yield return wait; continue; }
+            if (!player) { yield return wait; continue; }
+
+            Vector3 playerPos = player.position;
+
+            if (!NavMesh.SamplePosition(playerPos, out var baseHit, navmeshCheckRadius, NavMesh.AllAreas))
+            { if (verboseLog) Debug.Log("[Spawner] no navmesh near player"); yield return wait; continue; }
+
+            Vector3 baseCenter = baseHit.position;
+
+            if (!TryFindSpawnOnNavMesh(baseCenter, minSpawnDistance, Mathf.Max(minSpawnDistance + 5f, maxSpawnDistance), triesPerRing, out var spawnPos))
             {
-                // NavMesh 未生成フレームはスキップ
-                yield return wait;
-                continue;
+                if (!TryPickTriangleCentroid(tri, out spawnPos))
+                { if (verboseLog) Debug.Log("[Spawner] failed to get spawn pos"); yield return wait; continue; }
             }
 
-            Vector3 spawnPos;
-            bool ok = TryFindSpawnOnNavMesh(
-                player ? player.position : Vector3.zero,
-                minSpawnDistance, maxSpawnDistance,
-                triesPerRing, out spawnPos
-            );
+            SpawnEnemySafelyAt(spawnPos);
 
-            if (!ok) ok = TryPickTriangleCentroid(tri, out spawnPos);
-
-            if (ok) SpawnEnemyAt(spawnPos);
             yield return wait;
         }
     }
 
-    bool TryFindSpawnOnNavMesh(Vector3 center, float minR, float maxR, int tries, out Vector3 result)
+    bool TryFindSpawnOnNavMesh(Vector3 centerOnNav, float minR, float maxR, int tries, out Vector3 result)
     {
         float r = Mathf.Max(1f, minR);
-
         for (int step = 0; step < 3; step++)
         {
             for (int i = 0; i < tries; i++)
             {
                 Vector2 dir = Random.insideUnitCircle.normalized;
                 float d = Random.Range(r, maxR);
-                Vector3 guess = new Vector3(center.x + dir.x * d, center.y + 5f, center.z + dir.y * d);
+                Vector3 guess = new(centerOnNav.x + dir.x * d, centerOnNav.y + 2f, centerOnNav.z + dir.y * d);
 
-                // ★ NavMesh上の厳密座標を取得
                 if (NavMesh.SamplePosition(guess, out var hit, Mathf.Max(2f, r), NavMesh.AllAreas))
-                {
-                    result = hit.position;
-                    return true;
-                }
+                { result = hit.position; return true; }
             }
             r = Mathf.Min(maxR, r * 1.8f);
         }
-        result = Vector3.zero;
-        return false;
+        result = Vector3.zero; return false;
     }
 
     bool TryPickTriangleCentroid(NavMeshTriangulation tri, out Vector3 pos)
@@ -90,37 +91,43 @@ public class EnemySpawner : MonoBehaviour
         Vector3 a = tri.vertices[tri.indices[t]];
         Vector3 b = tri.vertices[tri.indices[t + 1]];
         Vector3 c = tri.vertices[tri.indices[t + 2]];
-
-        // 念のためもう一度サンプルしてNavMesh上にスナップ
         Vector3 centroid = (a + b + c) / 3f;
-        if (NavMesh.SamplePosition(centroid, out var hit, 5f, NavMesh.AllAreas))
-        {
-            pos = hit.position;
-            return true;
-        }
-        pos = Vector3.zero;
-        return false;
+
+        if (NavMesh.SamplePosition(centroid, out var hit, 10f, NavMesh.AllAreas))
+        { pos = hit.position; return true; }
+
+        pos = Vector3.zero; return false;
     }
 
-    void SpawnEnemyAt(Vector3 position)
+    void SpawnEnemySafelyAt(Vector3 spawnPos)
     {
         if (enemyPrefabs == null || enemyPrefabs.Length == 0) return;
+
         var prefab = enemyPrefabs[Random.Range(0, enemyPrefabs.Length)];
         if (!prefab) return;
 
-        var go = Instantiate(prefab, position, Quaternion.identity);
+        var go = Instantiate(prefab);
+        go.SetActive(false);
 
-        // ★ NavMeshAgent を確実に NavMesh 上にワープ（Prefab に付いている場合）
         var agent = go.GetComponent<NavMeshAgent>();
+        if (agent) agent.enabled = false;
+
+        if (!NavMesh.SamplePosition(spawnPos, out var hit, 5f, NavMesh.AllAreas))
+        { Destroy(go); return; }
+
+        go.transform.SetPositionAndRotation(hit.position, Quaternion.identity);
+
         if (agent)
         {
-            if (!agent.Warp(position))
+            agent.enabled = true;
+            if (!agent.Warp(hit.position))
             {
-                if (NavMesh.SamplePosition(position, out var hit, 5f, NavMesh.AllAreas))
-                {
-                    agent.Warp(hit.position);
-                }
+                if (NavMesh.SamplePosition(hit.position, out var hit2, 5f, NavMesh.AllAreas))
+                    agent.Warp(hit2.position);
             }
         }
+
+        go.SetActive(true);
+        if (verboseLog) Debug.Log("[Spawner] spawned at " + hit.position);
     }
 }
