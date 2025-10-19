@@ -11,8 +11,14 @@ public class InfiniteCityBSPManager : MonoBehaviour
 
     [Header("Buildings")]
     public GameObject[] buildingPrefabs;          // Building1/2/3 をここへ
-    public bool placeLotBaseBlock = true;  // 区画の大ブロックを置くか
-    public Vector2Int buildingsPerLot = new Vector2Int(1, 3);
+    public bool placeLotBaseBlock = true;  // 区画ベースブロックを置くか
+
+    // ★ CityChunkBSP の敷き詰め用フィールドに対応（buildingsPerLot は廃止）
+    public bool packBuildingsInGrid = true;      // グリッドで整列配置
+    public float buildingGridPadding = 0.5f;      // 建物同士の隙間(ワールド)
+    public float lotEdgeMargin = 0.5f;      // 道へはみ出さない外周余白
+    public int maxBuildingsPerLot = 200;       // 1区画あたりの上限
+    public bool staticCombinePerLot = true;      // 合体して軽量化
 
     [Header("World / Chunk")]
     [Min(1f)] public float cellSize = 10f;   // 1セルの実サイズ
@@ -91,25 +97,31 @@ public class InfiniteCityBSPManager : MonoBehaviour
         // === CityChunkBSP の公開フィールドに転送 ===
         chunk.buildingPrefabs = buildingPrefabs;
         chunk.placeLotBaseBlock = placeLotBaseBlock;
-        chunk.buildingsPerLot = buildingsPerLot;
 
+        // 建物敷き詰め系（※ buildingsPerLot は使いません）
+        chunk.packBuildingsInGrid = packBuildingsInGrid;
+        chunk.buildingGridPadding = buildingGridPadding;
+        chunk.lotEdgeMargin = lotEdgeMargin;
+        chunk.maxBuildingsPerLot = maxBuildingsPerLot;
+        chunk.staticCombinePerLot = staticCombinePerLot;
+
+        // 道生成パラメータ
         chunk.globalArterialPeriod = globalArterialPeriod;
         chunk.globalArterialWidth = globalArterialWidth;
-
         chunk.minPartitionSize = minPartitionSize;
         chunk.extraCrossChance = extraCrossChance;
         chunk.extraCrossWidth = extraCrossWidth;
 
+        // ロット・見た目
         chunk.minLotAreaCells = minLotAreaCells;
         chunk.mergeDiagonals = mergeDiagonals;
-
         chunk.wayTileFillXZ = wayTileFillXZ;
         chunk.wayTileFillY = wayTileFillY;
         chunk.blockFillXZ = blockFillXZ;
         chunk.blockFillY = blockFillY;
 
+        // 地形/ナビ
         chunk.groundMask = groundMask;
-
         chunk.bakeNavMeshPerChunk = bakeNavMeshPerChunk;
         chunk.agentTypeId = agentTypeId;
 
