@@ -22,8 +22,8 @@ public class EnemySpawner : MonoBehaviour
     {
         if (player == null)
         {
-            var playerObj = GameObject.FindGameObjectWithTag("Player");
-            player = playerObj ? playerObj.transform : FindObjectOfType<Transform>();
+            var tagged = GameObject.FindGameObjectWithTag("Player");
+            player = tagged ? tagged.transform : FindObjectOfType<Transform>();
         }
         StartCoroutine(SpawnLoop());
     }
@@ -37,7 +37,7 @@ public class EnemySpawner : MonoBehaviour
             var tri = NavMesh.CalculateTriangulation();
             if (tri.vertices == null || tri.vertices.Length == 0)
             {
-                Debug.LogWarning("EnemySpawner: NavMesh がまだ無いので待機");
+                // NavMesh 未生成フレームはスキップ
                 yield return wait;
                 continue;
             }
@@ -52,8 +52,6 @@ public class EnemySpawner : MonoBehaviour
             if (!ok) ok = TryPickTriangleCentroid(tri, out spawnPos);
 
             if (ok) SpawnEnemyAt(spawnPos);
-            else Debug.LogWarning("EnemySpawner: NavMesh 上のスポーン位置取得に失敗");
-
             yield return wait;
         }
     }
@@ -68,9 +66,10 @@ public class EnemySpawner : MonoBehaviour
             {
                 Vector2 dir = Random.insideUnitCircle.normalized;
                 float d = Random.Range(r, maxR);
-                Vector3 p = new Vector3(center.x + dir.x * d, center.y + 5f, center.z + dir.y * d);
+                Vector3 guess = new Vector3(center.x + dir.x * d, center.y + 5f, center.z + dir.y * d);
 
-                if (NavMesh.SamplePosition(p, out var hit, Mathf.Max(2f, r), NavMesh.AllAreas))
+                // ★ NavMesh上の厳密座標を取得
+                if (NavMesh.SamplePosition(guess, out var hit, Mathf.Max(2f, r), NavMesh.AllAreas))
                 {
                     result = hit.position;
                     return true;
@@ -78,7 +77,6 @@ public class EnemySpawner : MonoBehaviour
             }
             r = Mathf.Min(maxR, r * 1.8f);
         }
-
         result = Vector3.zero;
         return false;
     }
@@ -86,7 +84,6 @@ public class EnemySpawner : MonoBehaviour
     bool TryPickTriangleCentroid(NavMeshTriangulation tri, out Vector3 pos)
     {
         if (tri.indices == null || tri.indices.Length < 3) { pos = Vector3.zero; return false; }
-
         int triCount = tri.indices.Length / 3;
         int t = Random.Range(0, triCount) * 3;
 
@@ -94,8 +91,15 @@ public class EnemySpawner : MonoBehaviour
         Vector3 b = tri.vertices[tri.indices[t + 1]];
         Vector3 c = tri.vertices[tri.indices[t + 2]];
 
-        pos = (a + b + c) / 3f;
-        return true;
+        // 念のためもう一度サンプルしてNavMesh上にスナップ
+        Vector3 centroid = (a + b + c) / 3f;
+        if (NavMesh.SamplePosition(centroid, out var hit, 5f, NavMesh.AllAreas))
+        {
+            pos = hit.position;
+            return true;
+        }
+        pos = Vector3.zero;
+        return false;
     }
 
     void SpawnEnemyAt(Vector3 position)
@@ -104,6 +108,19 @@ public class EnemySpawner : MonoBehaviour
         var prefab = enemyPrefabs[Random.Range(0, enemyPrefabs.Length)];
         if (!prefab) return;
 
-        Instantiate(prefab, position, Quaternion.identity);
+        var go = Instantiate(prefab, position, Quaternion.identity);
+
+        // ★ NavMeshAgent を確実に NavMesh 上にワープ（Prefab に付いている場合）
+        var agent = go.GetComponent<NavMeshAgent>();
+        if (agent)
+        {
+            if (!agent.Warp(position))
+            {
+                if (NavMesh.SamplePosition(position, out var hit, 5f, NavMesh.AllAreas))
+                {
+                    agent.Warp(hit.position);
+                }
+            }
+        }
     }
 }
