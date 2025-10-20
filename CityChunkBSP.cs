@@ -75,6 +75,29 @@ public class CityChunkBSP : IDisposable
     [Tooltip("スタンプ処理でフレーム分割しない（小さなチャンク向け）")]
     public bool noYieldDuringStamp = true;
 
+    // 3サイズのビル（セル単位: 10x10 / 20x20 / 30x30 を想定）
+    [Header("Packing: Building Prefabs by Size (cells)")]
+    public GameObject prefab10;
+    public GameObject prefab20;
+    public GameObject prefab30;
+    // === New: rectangle footprints (world meters) ===
+    // 例: 50×50 / 60×60 / 40×60（60×40 は回転で自動対応）
+    [Header("Packing: Prefab Sets (meters)")]
+    public GameObject[] prefabs50x50;
+    public GameObject[] prefabs60x60;
+    public GameObject[] prefabs40x60;
+
+    // ランダム化つまみ
+    [Header("Packing: Randomization")]
+    [Range(0f, 1f)][SerializeField] float positionShuffleRate = 1f; // 位置スキャン順のシャッフル強度（1=完全シャッフル）
+    [Range(0f, 0.3f)][SerializeField] float epsilon = 0.05f;        // ε-greedy：稀に優先度を崩す（0=常に30→20→10）
+    [Min(1)][SerializeField] int multiStart = 2;                    // マルチスタート試行回数（1で従来同等）
+    [SerializeField] int randSeedOffset = 12345;                     // ロット毎の再現性用オフセット
+    [SerializeField] bool deterministicPerLot = true;                // 同一ロットは毎回同じ結果に
+
+    // セル配置の上限（安全弁）
+    [SerializeField] int maxCellsToScanPerLot = 200000;
+
     public enum CellType { Empty, Way }
     CellType[,] grid;
     System.Random rng;
@@ -277,7 +300,7 @@ public class CityChunkBSP : IDisposable
             }
     }
 
-    struct Lot { public List<Vector2Int> cells; public int minX, minZ, maxX, maxZ; public bool touchesWay; }
+    public struct Lot { public List<Vector2Int> cells; public int minX, minZ, maxX, maxZ; public bool touchesWay; }
 
     List<Lot> BuildLotsFromRemaining(bool touchesWayOnly)
     {
@@ -399,80 +422,43 @@ public class CityChunkBSP : IDisposable
             // 歩道コネクタ（任意）
             if (ensureSidewalkConnectors) AddLotSidewalkConnectors(lot);
 
-            // 建物敷き詰め（グリッド）
-            if (buildingPrefabs != null && buildingPrefabs.Length > 0 && packBuildingsInGrid && lotW > 0f && lotD > 0f)
+            // 建物敷き詰め（BuildingPacker に委譲）
+            if (packBuildingsInGrid && lotW > 0f && lotD > 0f)
             {
-                // 代表プレハブからおおよその占有サイズを推定
-                Vector2 fp = EstimatePrefabFootprintXZ(buildingPrefabs[0]);
-                fp.x = Mathf.Max(0.1f, fp.x);
-                fp.y = Mathf.Max(0.1f, fp.y);
-
-                float pitchX = fp.x + buildingGridPadding;
-                float pitchZ = fp.y + buildingGridPadding;
-
-                int cols = Mathf.Clamp(Mathf.FloorToInt(lotW / pitchX), 0, 512);
-                int rows = Mathf.Clamp(Mathf.FloorToInt(lotD / pitchZ), 0, 512);
-
-                int placed = 0;
-                float startX = (lotMinX + lotMaxX) * 0.5f - (cols * pitchX) * 0.5f + pitchX * 0.5f;
-                float startZ = (lotMinZ + lotMaxZ) * 0.5f - (rows * pitchZ) * 0.5f + pitchZ * 0.5f;
-
-                var lotGroup = new GameObject("BuildingsLot");
-                lotGroup.transform.SetParent(parent, false);
-                lotGroup.transform.position = new Vector3(OriginX, 0f, OriginZ);
-
-                for (int rz = 0; rz < rows; rz++)
+                var packer = new BuildingPacker
                 {
-                    for (int cx = 0; cx < cols; cx++)
-                    {
-                        if (placed >= maxBuildingsPerLot) break;
+                    // プレハブ群（Manager から受け取っている前提：このクラスの public フィールド）
+                    prefab10 = prefab10,
+                    prefab20 = prefab20,
+                    prefab30 = prefab30,
+                    prefabs50x50 = prefabs50x50,
+                    prefabs60x60 = prefabs60x60,
+                    prefabs40x60 = prefabs40x60,
+                    // ランダム＆制限
+                    positionShuffleRate = positionShuffleRate,
+                    epsilon = epsilon,
+                    multiStart = multiStart,
+                    randSeedOffset = randSeedOffset,
+                    deterministicPerLot = deterministicPerLot,
+                    maxCellsToScanPerLot = maxCellsToScanPerLot,
+                    maxBuildingsPerLot = maxBuildingsPerLot
+                };
 
-                        var prefab = buildingPrefabs[rng.Next(buildingPrefabs.Length)];
-                        if (!prefab) continue;
+                var ctx = new BuildingPacker.Context
+                {
+                    EffCell = EffCell,
+                    OriginX = OriginX,
+                    OriginZ = OriginZ,
+                    tilesPerFrame = tilesPerFrame,
+                    noYield = noYieldDuringStamp,
+                    lotEdgeMargin = lotEdgeMargin,
+                    SampleSupportTopY = SampleSupportTopY,
+                    FitToSize = Fit
+                };
 
-                        float x = startX + cx * pitchX;
-                        float z = startZ + rz * pitchZ;
-                        float groundY = SampleGroundY(x, z);
-
-                        // いったん地面高さに生成
-                        var b = UnityEngine.Object.Instantiate(
-                            prefab,
-                            new Vector3(x, groundY, z),
-                            Quaternion.identity,
-                            lotGroup.transform
-                        );
-                        if (!b) continue;
-
-                        // === ここが重要：建物の「下端」を地面に合わせる ===
-                        // Renderer の Bounds を集約して下端オフセットを求め、原点でのズレを補正
-                        var renderers = b.GetComponentsInChildren<Renderer>(true);
-                        if (renderers != null && renderers.Length > 0)
-                        {
-                            Bounds bounds = renderers[0].bounds;
-                            for (int i = 1; i < renderers.Length; i++) bounds.Encapsulate(renderers[i].bounds);
-
-                            // 現在 position は建物のローカル原点 → bounds.min.y との差で上下補正量を算出
-                            float bottomOffset = bounds.min.y - b.transform.position.y;
-                            // 下端が groundY に一致するように移動
-                            b.transform.position = new Vector3(b.transform.position.x, b.transform.position.y - bottomOffset, b.transform.position.z);
-                        }
-
-                        // 必要に応じて微ランダムなヨー回転（街並みに変化）
-                        // ※ 回転が不都合ならコメントアウトしてください
-                        // b.transform.Rotate(0f, rng.Next(0, 4) * 90f, 0f, Space.World);
-
-                        b.isStatic = staticCombinePerLot;
-
-                        placed++;
-                    }
-
-                    if (placed >= maxBuildingsPerLot) break;
-                    if (--budget <= 0) { budget = tilesPerFrame; yield return null; }
-                }
-
-                if (staticCombinePerLot) TryStaticCombine(lotGroup);
+                // packer 内部で BuildingsLot を作り、静的結合まで行う
+                yield return packer.PlaceOnLot(lot, parent, ctx, staticCombinePerLot);
             }
-
             if (--budget <= 0) { budget = tilesPerFrame; yield return null; }
         }
     }
@@ -665,6 +651,242 @@ public class CityChunkBSP : IDisposable
         if (anyMr) mrCombined.sharedMaterials = anyMr.sharedMaterials;
     }
 
+    struct SizeOption
+    {
+        public int wM, dM;           // メートル単位
+        public int sx, sz;           // セル数（ceil(m/EffCell)）
+        public GameObject[] prefabs; // 同サイズに複数あるときランダムPick
+        public int AreaM2 => wM * dM;
+    }
+
+    struct PackPlaced
+    {
+        public int gx, gz;          // ロット内セル座標（左上）
+        public int sx, sz;          // 占有セル
+        public SizeOption option;   // どのサイズオプションを置いたか
+    }
+
+    System.Collections.IEnumerator PlaceBuildingsPackedCoroutine(Lot lot, GameObject lotGroup, int budget)
+    {
+        // 1) ロット内セル領域（マージン控除）
+        int marginCells = Mathf.CeilToInt(Mathf.Max(0f, lotEdgeMargin) / EffCell);
+        int innerMinX = lot.minX + marginCells;
+        int innerMaxX = lot.maxX - marginCells;
+        int innerMinZ = lot.minZ + marginCells;
+        int innerMaxZ = lot.maxZ - marginCells;
+
+        if (innerMinX > innerMaxX || innerMinZ > innerMaxZ) yield break;
+
+        int innerW = innerMaxX - innerMinX + 1;
+        int innerH = innerMaxZ - innerMinZ + 1;
+        if (innerW <= 0 || innerH <= 0) yield break;
+
+        // 2) 候補サイズ（meters）+ プレハブ配列
+        var options = new List<SizeOption>();
+
+        void AddOptionMeters(int wM, int dM, GameObject[] set)
+        {
+            if (set == null || set.Length == 0) return;
+            int sx = Mathf.Max(1, Mathf.CeilToInt(wM / EffCell));
+            int sz = Mathf.Max(1, Mathf.CeilToInt(dM / EffCell));
+            options.Add(new SizeOption { wM = wM, dM = dM, sx = sx, sz = sz, prefabs = set });
+        }
+
+        // 面積の大きい順に基本優先：60x60 > 50x50 > 60x40/40x60
+        AddOptionMeters(60, 60, prefabs60x60);
+        AddOptionMeters(50, 50, prefabs50x50);
+        AddOptionMeters(40, 60, prefabs40x60); // 60x40 は回転で対応
+
+        // 後方互換（任意）：旧 30/20/10 をメートル扱いで使うことも可能
+        if (prefab30) AddOptionMeters(30, 30, new[] { prefab30 });
+        if (prefab20) AddOptionMeters(20, 20, new[] { prefab20 });
+        if (prefab10) AddOptionMeters(10, 10, new[] { prefab10 });
+
+        if (options.Count == 0) yield break;
+        options.Sort((a, b) => b.AreaM2.CompareTo(a.AreaM2)); // 面積降順
+
+        // 3) ロット単位の乱数（deterministicPerLot で固定可）
+        int lotHash;
+        unchecked
+        {
+            lotHash = innerMinX * 73856093 ^ innerMinZ * 19349663 ^ innerW * 83492791 ^ innerH * 297121507;
+        }
+        int seed = deterministicPerLot ? unchecked(randSeedOffset ^ lotHash)
+                                       : UnityEngine.Random.Range(int.MinValue, int.MaxValue);
+        var rng = new System.Random(seed);
+
+        // 4) マルチスタート（複数回ランダム試行）
+        int trials = Mathf.Max(1, multiStart);
+        List<PackPlaced> best = null;
+        int bestOcc = -1;
+
+        for (int t = 0; t < trials; t++)
+        {
+            var placed = TryPackOnce(innerW, innerH, options, rng, out int occupiedCells);
+            if (occupiedCells > bestOcc)
+            {
+                bestOcc = occupiedCells;
+                best = placed;
+            }
+        }
+        if (best == null || best.Count == 0) yield break;
+
+        // 5) 実体化（ローカル予算で分割実行）
+        int localBudget = Mathf.Max(1, budget);
+        int count = 0;
+
+        foreach (var p in best)
+        {
+            float minX = OriginX + (innerMinX + p.gx) * EffCell;
+            float minZ = OriginZ + (innerMinZ + p.gz) * EffCell;
+
+            float widthW = p.sx * EffCell;
+            float depthW = p.sz * EffCell;
+            float cx = minX + widthW * 0.5f;
+            float cz = minZ + depthW * 0.5f;
+            float gy = SampleSupportTopY(cx, cz); // 台座/地面の上面
+
+            // プレハブはサイズオプションの配列から乱択
+            var set = p.option.prefabs;
+            GameObject prefab = (set != null && set.Length > 0) ? set[rng.Next(set.Length)] : null;
+            if (prefab)
+            {
+                var go = UnityEngine.Object.Instantiate(prefab, new Vector3(cx, gy, cz), Quaternion.identity, lotGroup.transform);
+                if (go)
+                {
+                    // 下端スナップ
+                    var renderers = go.GetComponentsInChildren<Renderer>(true);
+                    if (renderers != null && renderers.Length > 0)
+                    {
+                        Bounds b = renderers[0].bounds;
+                        for (int i = 1; i < renderers.Length; i++) b.Encapsulate(renderers[i].bounds);
+                        float bottomOffset = b.min.y - go.transform.position.y;
+                        go.transform.position = new Vector3(go.transform.position.x, go.transform.position.y - bottomOffset, go.transform.position.z);
+                    }
+
+                    // XZ をセル矩形にフィット（Yは等倍のまま）
+                    float fitY = (go.GetComponentInChildren<Renderer>() != null)
+                        ? go.GetComponentInChildren<Renderer>().bounds.size.y
+                        : go.transform.localScale.y;
+                    Fit(go, widthW, fitY, depthW);
+
+                    go.isStatic = staticCombinePerLot;
+                }
+
+                count++;
+                if (count >= maxBuildingsPerLot) break;
+
+                if (!noYieldDuringStamp && --localBudget <= 0)
+                {
+                    localBudget = tilesPerFrame;
+                    yield return null;
+                }
+            }
+        }
+    }
+
+
+
+    // 1回分のランダム貪欲パック（面積優先、ε-greedyで順序崩し、座標スキャンはシャッフル）
+    System.Collections.Generic.List<PackPlaced> TryPackOnce(
+        int W, int H, System.Collections.Generic.List<SizeOption> baseOrder, System.Random rng, out int occupied)
+    {
+        occupied = 0;
+        var result = new System.Collections.Generic.List<PackPlaced>(128);
+        if (W <= 0 || H <= 0) return result;
+
+        // 空き配列（false = 空き）
+        bool[,] occ = new bool[W, H];
+
+        // 候補セル順序：左上→右下を基本に、positionShuffleRate でシャッフル
+        var coords = new System.Collections.Generic.List<(int x, int z)>(W * H);
+        for (int z = 0; z < H; z++)
+            for (int x = 0; x < W; x++)
+                coords.Add((x, z));
+
+        if (positionShuffleRate > 0f)
+        {
+            int n = coords.Count;
+            int shuffleTo = (int)(n * Mathf.Clamp01(positionShuffleRate));
+            for (int i = 0; i < shuffleTo; i++)
+            {
+                int j = rng.Next(i, n);
+                (coords[i], coords[j]) = (coords[j], coords[i]);
+            }
+        }
+
+        int scanned = 0;
+        foreach (var c in coords)
+        {
+            if (scanned++ > maxCellsToScanPerLot) break;
+            if (occ[c.x, c.z]) continue;
+
+            // ε-greedy：稀にサイズ順を崩す
+            var order = baseOrder;
+            if (epsilon > 0f && rng.NextDouble() < epsilon)
+            {
+                order = new System.Collections.Generic.List<SizeOption>(baseOrder);
+                int i = rng.Next(order.Count);
+                int j = rng.Next(order.Count);
+                (order[i], order[j]) = (order[j], order[i]);
+            }
+
+            bool placedHere = false;
+            foreach (var opt in order)
+            {
+                // 0° と 90° を試す（正方形は同一）
+                var variants = (opt.sx == opt.sz)
+                    ? new (int sx, int sz)[] { (opt.sx, opt.sz) }
+                    : new (int sx, int sz)[] { (opt.sx, opt.sz), (opt.sz, opt.sx) };
+
+                for (int v = 0; v < variants.Length; v++)
+                {
+                    int sx = variants[v].sx;
+                    int sz = variants[v].sz;
+
+                    if (c.x + sx > W || c.z + sz > H) continue;
+                    if (!CellsFree(occ, c.x, c.z, sx, sz)) continue;
+
+                    // === 置く ===
+                    Mark(occ, c.x, c.z, sx, sz);
+                    occupied += sx * sz;
+
+                    result.Add(new PackPlaced
+                    {
+                        gx = c.x,
+                        gz = c.z,
+                        sx = sx,
+                        sz = sz,
+                        option = opt
+                    });
+
+                    placedHere = true;
+                    break;
+                }
+                if (placedHere) break;
+            }
+        }
+
+        return result;
+
+        // ---- ローカル関数 ----
+        bool CellsFree(bool[,] map, int x0, int z0, int sx, int sz)
+        {
+            for (int z = 0; z < sz; z++)
+                for (int x = 0; x < sx; x++)
+                    if (map[x0 + x, z0 + z]) return false;
+            return true;
+        }
+
+        void Mark(bool[,] map, int x0, int z0, int sx, int sz)
+        {
+            for (int z = 0; z < sz; z++)
+                for (int x = 0; x < sx; x++)
+                    map[x0 + x, z0 + z] = true;
+        }
+    }
+
+
     // ===== NavMesh（連続床＋ブロックを収集、隣チャンクと重なる余白つき） =====
     void BuildChunkNavMeshSync()
     {
@@ -729,6 +951,19 @@ public class CityChunkBSP : IDisposable
     }
 
     // ====== 共通ユーティリティ ======
+    // 地面(groundMask) または Block レイヤーの「上面」を返す
+    // 地面(groundMask) または Block レイヤーの「上面」を返す
+    float SampleSupportTopY(float x, float z)
+    {
+        int blockMask = LayerMask.GetMask("Block");
+        int mask = groundMask.value != 0 ? (groundMask.value | blockMask) : blockMask;
+
+        Vector3 origin = new Vector3(x, 10000f, z);
+        if (Physics.Raycast(origin, Vector3.down, out var hit, 20000f, mask, QueryTriggerInteraction.Ignore))
+            return hit.point.y;
+        return 0f;
+    }
+
     Vector3 LocalToWorldCenter(int gx, int gz)
     {
         float wx = OriginX + (gx + 0.5f) * EffCell;
