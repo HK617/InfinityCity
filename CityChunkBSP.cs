@@ -29,6 +29,22 @@ public class CityChunkBSP : IDisposable
     [Range(0f, 1f)] public float extraCrossChance = 0.35f;
     [Range(0, 3)] public int extraCrossWidth = 1;
 
+    public enum RoadGenMode { BSP, RotatedGrid, RandomWalkers }
+    [Header("Road Generation: Mode & Params")]
+    public RoadGenMode roadMode = RoadGenMode.BSP;
+
+    // Rotated grid
+    [Range(-89f, 89f)] public float rotatedGridAngleDeg = 30f;
+    [Min(4)] public int rotatedGridPeriod = 14;
+    [Range(1, 3)] public int rotatedGridWidth = 1;
+
+    // Random walkers
+    [Min(1)] public int walkersCount = 6;
+    [Min(10)] public int walkerMaxSteps = 500;
+    [Range(0f, 1f)] public float walkerTurnBias = 0.25f;    // どれくらい曲がりやすいか
+    [Range(0f, 1f)] public float walkerJunctionBias = 0.10f; // Wayに接したら分岐しやすい
+
+
     [Header("Lots / Buildings")]
     public bool placeLotBaseBlock = true;
     public int minLotAreaCells = 3;
@@ -137,6 +153,21 @@ public class CityChunkBSP : IDisposable
 
     public IEnumerator GenerateAsync()
     {
+        switch (roadMode)
+        {
+            case RoadGenMode.BSP:
+                CarveGlobalArterials();
+                CarveRoadsBspStyle();
+                break;
+            case RoadGenMode.RotatedGrid:
+                ClearGrid();
+                CarveRotatedGrid();
+                break;
+            case RoadGenMode.RandomWalkers:
+                ClearGrid();
+                CarveRandomWalkers();
+                break;
+        }
         container.transform.localScale = Vector3.one * Mathf.Max(0.01f, globalScale);
         container.transform.position = new Vector3(OriginX, 0f, OriginZ);
 
@@ -247,6 +278,93 @@ public class CityChunkBSP : IDisposable
             {
                 CarveH(Mathf.Max(0, x - extraCrossWidth), Mathf.Min(chunkTiles, x + extraCrossWidth + 1), z, 1);
                 CarveV(Mathf.Max(0, z - extraCrossWidth), Mathf.Min(chunkTiles, z + extraCrossWidth + 1), x, 1);
+            }
+        }
+    }
+
+    void ClearGrid()
+    {
+        for (int x = 0; x < chunkTiles; x++)
+            for (int z = 0; z < chunkTiles; z++)
+                grid[x, z] = CellType.Empty;
+    }
+
+    void CarveRotatedGrid()
+    {
+        float theta = rotatedGridAngleDeg * Mathf.Deg2Rad;
+        float cos = Mathf.Cos(theta), sin = Mathf.Sin(theta);
+
+        int period = Mathf.Max(2, rotatedGridPeriod);
+        int width = Mathf.Clamp(rotatedGridWidth, 1, 3);
+
+        for (int lx = 0; lx < chunkTiles; lx++)
+        {
+            for (int lz = 0; lz < chunkTiles; lz++)
+            {
+                int wx = WorldCellX(lx);
+                int wz = WorldCellZ(lz);
+
+                float ux = wx * cos + wz * sin;
+                float uz = -wx * sin + wz * cos;
+
+                int mx = Mathf.Abs(Mod(Mathf.RoundToInt(ux), period));
+                int mz = Mathf.Abs(Mod(Mathf.RoundToInt(uz), period));
+
+                bool onX = (mx == 0);
+                bool onZ = (mz == 0);
+
+                if (onX || onZ)
+                {
+                    if (onX)
+                        for (int w = -((width - 1) / 2); w <= (width - 1) / 2; w++)
+                        {
+                            int zz = lz + w;
+                            if (zz >= 0 && zz < chunkTiles)
+                                grid[lx, zz] = CellType.Way;
+                        }
+                    if (onZ)
+                        for (int w = -((width - 1) / 2); w <= (width - 1) / 2; w++)
+                        {
+                            int xx = lx + w;
+                            if (xx >= 0 && xx < chunkTiles)
+                                grid[xx, lz] = CellType.Way;
+                        }
+                }
+            }
+        }
+    }
+
+    void CarveRandomWalkers()
+    {
+        var dirs = new Vector2Int[] { new(1, 0), new(-1, 0), new(0, 1), new(0, -1) };
+
+        for (int i = 0; i < walkersCount; i++)
+        {
+            int x = rng.Next(1, chunkTiles - 1);
+            int z = rng.Next(1, chunkTiles - 1);
+            int d = rng.Next(0, dirs.Length);
+
+            for (int step = 0; step < walkerMaxSteps; step++)
+            {
+                if (!InRange(x, z)) break;
+                grid[x, z] = CellType.Way;
+
+                if (TouchesWay4(x, z) && rng.NextDouble() < walkerJunctionBias)
+                {
+                    int nd = (d + (rng.Next(0, 2) == 0 ? 1 : 3)) & 3;
+                    var b = dirs[nd];
+                    int bx = x + b.x, bz = z + b.y;
+                    if (InRange(bx, bz)) grid[bx, bz] = CellType.Way;
+                }
+
+                if (rng.NextDouble() < walkerTurnBias)
+                    d = (d + (rng.Next(0, 2) == 0 ? 1 : 3)) & 3;
+
+                var mv = dirs[d];
+                x += mv.x; z += mv.y;
+
+                if (x <= 1 || x >= chunkTiles - 2 || z <= 1 || z >= chunkTiles - 2)
+                    d = (d + 2) & 3;
             }
         }
     }
@@ -650,242 +768,6 @@ public class CityChunkBSP : IDisposable
         var anyMr = filters[0].GetComponent<MeshRenderer>();
         if (anyMr) mrCombined.sharedMaterials = anyMr.sharedMaterials;
     }
-
-    struct SizeOption
-    {
-        public int wM, dM;           // メートル単位
-        public int sx, sz;           // セル数（ceil(m/EffCell)）
-        public GameObject[] prefabs; // 同サイズに複数あるときランダムPick
-        public int AreaM2 => wM * dM;
-    }
-
-    struct PackPlaced
-    {
-        public int gx, gz;          // ロット内セル座標（左上）
-        public int sx, sz;          // 占有セル
-        public SizeOption option;   // どのサイズオプションを置いたか
-    }
-
-    System.Collections.IEnumerator PlaceBuildingsPackedCoroutine(Lot lot, GameObject lotGroup, int budget)
-    {
-        // 1) ロット内セル領域（マージン控除）
-        int marginCells = Mathf.CeilToInt(Mathf.Max(0f, lotEdgeMargin) / EffCell);
-        int innerMinX = lot.minX + marginCells;
-        int innerMaxX = lot.maxX - marginCells;
-        int innerMinZ = lot.minZ + marginCells;
-        int innerMaxZ = lot.maxZ - marginCells;
-
-        if (innerMinX > innerMaxX || innerMinZ > innerMaxZ) yield break;
-
-        int innerW = innerMaxX - innerMinX + 1;
-        int innerH = innerMaxZ - innerMinZ + 1;
-        if (innerW <= 0 || innerH <= 0) yield break;
-
-        // 2) 候補サイズ（meters）+ プレハブ配列
-        var options = new List<SizeOption>();
-
-        void AddOptionMeters(int wM, int dM, GameObject[] set)
-        {
-            if (set == null || set.Length == 0) return;
-            int sx = Mathf.Max(1, Mathf.CeilToInt(wM / EffCell));
-            int sz = Mathf.Max(1, Mathf.CeilToInt(dM / EffCell));
-            options.Add(new SizeOption { wM = wM, dM = dM, sx = sx, sz = sz, prefabs = set });
-        }
-
-        // 面積の大きい順に基本優先：60x60 > 50x50 > 60x40/40x60
-        AddOptionMeters(60, 60, prefabs60x60);
-        AddOptionMeters(50, 50, prefabs50x50);
-        AddOptionMeters(40, 60, prefabs40x60); // 60x40 は回転で対応
-
-        // 後方互換（任意）：旧 30/20/10 をメートル扱いで使うことも可能
-        if (prefab30) AddOptionMeters(30, 30, new[] { prefab30 });
-        if (prefab20) AddOptionMeters(20, 20, new[] { prefab20 });
-        if (prefab10) AddOptionMeters(10, 10, new[] { prefab10 });
-
-        if (options.Count == 0) yield break;
-        options.Sort((a, b) => b.AreaM2.CompareTo(a.AreaM2)); // 面積降順
-
-        // 3) ロット単位の乱数（deterministicPerLot で固定可）
-        int lotHash;
-        unchecked
-        {
-            lotHash = innerMinX * 73856093 ^ innerMinZ * 19349663 ^ innerW * 83492791 ^ innerH * 297121507;
-        }
-        int seed = deterministicPerLot ? unchecked(randSeedOffset ^ lotHash)
-                                       : UnityEngine.Random.Range(int.MinValue, int.MaxValue);
-        var rng = new System.Random(seed);
-
-        // 4) マルチスタート（複数回ランダム試行）
-        int trials = Mathf.Max(1, multiStart);
-        List<PackPlaced> best = null;
-        int bestOcc = -1;
-
-        for (int t = 0; t < trials; t++)
-        {
-            var placed = TryPackOnce(innerW, innerH, options, rng, out int occupiedCells);
-            if (occupiedCells > bestOcc)
-            {
-                bestOcc = occupiedCells;
-                best = placed;
-            }
-        }
-        if (best == null || best.Count == 0) yield break;
-
-        // 5) 実体化（ローカル予算で分割実行）
-        int localBudget = Mathf.Max(1, budget);
-        int count = 0;
-
-        foreach (var p in best)
-        {
-            float minX = OriginX + (innerMinX + p.gx) * EffCell;
-            float minZ = OriginZ + (innerMinZ + p.gz) * EffCell;
-
-            float widthW = p.sx * EffCell;
-            float depthW = p.sz * EffCell;
-            float cx = minX + widthW * 0.5f;
-            float cz = minZ + depthW * 0.5f;
-            float gy = SampleSupportTopY(cx, cz); // 台座/地面の上面
-
-            // プレハブはサイズオプションの配列から乱択
-            var set = p.option.prefabs;
-            GameObject prefab = (set != null && set.Length > 0) ? set[rng.Next(set.Length)] : null;
-            if (prefab)
-            {
-                var go = UnityEngine.Object.Instantiate(prefab, new Vector3(cx, gy, cz), Quaternion.identity, lotGroup.transform);
-                if (go)
-                {
-                    // 下端スナップ
-                    var renderers = go.GetComponentsInChildren<Renderer>(true);
-                    if (renderers != null && renderers.Length > 0)
-                    {
-                        Bounds b = renderers[0].bounds;
-                        for (int i = 1; i < renderers.Length; i++) b.Encapsulate(renderers[i].bounds);
-                        float bottomOffset = b.min.y - go.transform.position.y;
-                        go.transform.position = new Vector3(go.transform.position.x, go.transform.position.y - bottomOffset, go.transform.position.z);
-                    }
-
-                    // XZ をセル矩形にフィット（Yは等倍のまま）
-                    float fitY = (go.GetComponentInChildren<Renderer>() != null)
-                        ? go.GetComponentInChildren<Renderer>().bounds.size.y
-                        : go.transform.localScale.y;
-                    Fit(go, widthW, fitY, depthW);
-
-                    go.isStatic = staticCombinePerLot;
-                }
-
-                count++;
-                if (count >= maxBuildingsPerLot) break;
-
-                if (!noYieldDuringStamp && --localBudget <= 0)
-                {
-                    localBudget = tilesPerFrame;
-                    yield return null;
-                }
-            }
-        }
-    }
-
-
-
-    // 1回分のランダム貪欲パック（面積優先、ε-greedyで順序崩し、座標スキャンはシャッフル）
-    System.Collections.Generic.List<PackPlaced> TryPackOnce(
-        int W, int H, System.Collections.Generic.List<SizeOption> baseOrder, System.Random rng, out int occupied)
-    {
-        occupied = 0;
-        var result = new System.Collections.Generic.List<PackPlaced>(128);
-        if (W <= 0 || H <= 0) return result;
-
-        // 空き配列（false = 空き）
-        bool[,] occ = new bool[W, H];
-
-        // 候補セル順序：左上→右下を基本に、positionShuffleRate でシャッフル
-        var coords = new System.Collections.Generic.List<(int x, int z)>(W * H);
-        for (int z = 0; z < H; z++)
-            for (int x = 0; x < W; x++)
-                coords.Add((x, z));
-
-        if (positionShuffleRate > 0f)
-        {
-            int n = coords.Count;
-            int shuffleTo = (int)(n * Mathf.Clamp01(positionShuffleRate));
-            for (int i = 0; i < shuffleTo; i++)
-            {
-                int j = rng.Next(i, n);
-                (coords[i], coords[j]) = (coords[j], coords[i]);
-            }
-        }
-
-        int scanned = 0;
-        foreach (var c in coords)
-        {
-            if (scanned++ > maxCellsToScanPerLot) break;
-            if (occ[c.x, c.z]) continue;
-
-            // ε-greedy：稀にサイズ順を崩す
-            var order = baseOrder;
-            if (epsilon > 0f && rng.NextDouble() < epsilon)
-            {
-                order = new System.Collections.Generic.List<SizeOption>(baseOrder);
-                int i = rng.Next(order.Count);
-                int j = rng.Next(order.Count);
-                (order[i], order[j]) = (order[j], order[i]);
-            }
-
-            bool placedHere = false;
-            foreach (var opt in order)
-            {
-                // 0° と 90° を試す（正方形は同一）
-                var variants = (opt.sx == opt.sz)
-                    ? new (int sx, int sz)[] { (opt.sx, opt.sz) }
-                    : new (int sx, int sz)[] { (opt.sx, opt.sz), (opt.sz, opt.sx) };
-
-                for (int v = 0; v < variants.Length; v++)
-                {
-                    int sx = variants[v].sx;
-                    int sz = variants[v].sz;
-
-                    if (c.x + sx > W || c.z + sz > H) continue;
-                    if (!CellsFree(occ, c.x, c.z, sx, sz)) continue;
-
-                    // === 置く ===
-                    Mark(occ, c.x, c.z, sx, sz);
-                    occupied += sx * sz;
-
-                    result.Add(new PackPlaced
-                    {
-                        gx = c.x,
-                        gz = c.z,
-                        sx = sx,
-                        sz = sz,
-                        option = opt
-                    });
-
-                    placedHere = true;
-                    break;
-                }
-                if (placedHere) break;
-            }
-        }
-
-        return result;
-
-        // ---- ローカル関数 ----
-        bool CellsFree(bool[,] map, int x0, int z0, int sx, int sz)
-        {
-            for (int z = 0; z < sz; z++)
-                for (int x = 0; x < sx; x++)
-                    if (map[x0 + x, z0 + z]) return false;
-            return true;
-        }
-
-        void Mark(bool[,] map, int x0, int z0, int sx, int sz)
-        {
-            for (int z = 0; z < sz; z++)
-                for (int x = 0; x < sx; x++)
-                    map[x0 + x, z0 + z] = true;
-        }
-    }
-
 
     // ===== NavMesh（連続床＋ブロックを収集、隣チャンクと重なる余白つき） =====
     void BuildChunkNavMeshSync()
