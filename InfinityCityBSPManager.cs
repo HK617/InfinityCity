@@ -6,53 +6,49 @@ public class InfiniteCityBSPManager : MonoBehaviour
     [Header("Player / Parents / Prefabs")]
     public Transform player;
     public Transform chunkParent;
-    public GameObject wayPrefab;     // Layer=Way（MeshRenderer か Collider を持たせる）
-    public GameObject blockPrefab;   // Layer=Block（ベース台座）
+    public GameObject wayPrefab;     // Layer=Way
+    public GameObject blockPrefab;   // Layer=Block
 
-    [Header("Buildings (legacy)")]
-    public GameObject[] buildingPrefabs;    // 互換用：CityChunkBSP へそのまま渡すだけ
-    public bool placeLotBaseBlock = true;
-
-    [Header("Building Prefabs (single, optional)")]
-    public GameObject prefab10;   // 10×10[m]相当（任意）
-    public GameObject prefab20;   // 20×20[m]相当（任意）
-    public GameObject prefab30;   // 30×30[m]相当（任意）
-
+    // ✅ 要望：legacy の単品/配列は廃止。使うのは 50/60/40x60 の3枠のみ
     [Header("Prefab Sets (meters)")]
-    public GameObject[] prefabs50x50;  // 50×50[m]
-    public GameObject[] prefabs60x60;  // 60×60[m]
-    public GameObject[] prefabs40x60;  // 40×60[m]（回転で60×40にも置く）
+    public GameObject[] prefabs50x50;   // 50×50
+    public GameObject[] prefabs60x60;   // 60×60
+    public GameObject[] prefabs40x60;   // 40×60（回転で60×40対応）
 
     [Header("Packing Options")]
-    public bool packBuildingsInGrid = true;
-    public float buildingGridPadding = 0.5f;
-    public float lotEdgeMargin = 0.2f;
-    public int maxBuildingsPerLot = 1000;
-    public bool staticCombinePerLot = true;
+    public bool packBuildingsInGrid = true;  // 建物をセルグリッドで詰める
+    public float buildingGridPadding = 0f;   // 建物同士の最小クリアランス（m）
+    public float lotEdgeMargin = 0f;         // ロット外周のマージン（m）
+    public int maxBuildingsPerLot = 100;   // 1ロットの最大配置数
+    public bool staticCombinePerLot = false;// 1ロットごとに静的結合
 
     [Header("World / Chunk")]
     [Min(1f)] public float cellSize = 10f;
-    [Min(8)] public int chunkTiles = 48;
-    [Min(1)] public int activeRange = 2;
+    [Min(4)] public int chunkTiles = 10;
+    [Min(1)] public int activeRange = 3;
     public int seed = 12345;
-    [Min(64)] public int tilesPerFrame = 1500;
+    [Min(64)] public int tilesPerFrame = 2000;
 
     [Header("Road Generation (Global + BSP)")]
-    public int globalArterialPeriod = 14;     // 道路疎めの推奨値
-    [Range(1, 3)] public int globalArterialWidth = 1;
-    public int minPartitionSize = 12;         // 細道が出にくくなる
-    [Range(0f, 1f)] public float extraCrossChance = 0.10f; // 交差追加を減らす
-    [Range(0, 3)] public int extraCrossWidth = 1;
+    public int globalArterialPeriod = 20;
+    [Range(1, 5)] public int globalArterialWidth = 1; // ✅ 大通りの幅（セル）
+    public int minPartitionSize = 12;
+    [Range(0f, 1f)] public float extraCrossChance = 0.10f;
+    [Range(1, 5)] public int extraCrossWidth = 1;
+
+    [Header("Road Widths (Local)")]
+    [Range(1, 5)] public int bspRoadWidth = 1;       // ✅ BSPモードの細街路の幅（セル）
+    [Range(1, 5)] public int walkerPathWidth = 1;    // ✅ RandomWalkersモードの通路幅（セル）
 
     [Header("Lots")]
-    public int minLotAreaCells = 3;
-    public bool mergeDiagonals = false;
+    public int minLotAreaCells = 25;
+    public bool mergeDiagonals = true;
 
     [Header("Visual Fill")]
     [Range(0.1f, 1f)] public float wayTileFillXZ = 1.0f;
     [Range(0.05f, 1f)] public float wayTileFillY = 0.10f;
-    [Range(0.1f, 1f)] public float blockFillXZ = 0.90f;
-    [Range(0.05f, 3f)] public float blockFillY = 1.20f;
+    [Range(0.1f, 1f)] public float blockFillXZ = 1.0f;
+    [Range(0.05f, 3f)] public float blockFillY = 0.05f;
 
     [Header("Ground (0=unused)")]
     public LayerMask groundMask = 0;
@@ -60,7 +56,6 @@ public class InfiniteCityBSPManager : MonoBehaviour
     [Header("NavMesh")]
     public bool bakeNavMeshPerChunk = true;
     public int agentTypeId = 0;
-    [Tooltip("道だけでなく区画ブロックも NavMesh に含める")]
     public bool includeBlocksInNavMesh = true;
 
     [Header("Performance / Scale")]
@@ -74,39 +69,26 @@ public class InfiniteCityBSPManager : MonoBehaviour
     void Update()
     {
         if (!player || !wayPrefab) return;
-
-        Vector2Int pc = WorldToChunk(player.position);
+        var pc = WorldToChunk(player.position);
 
         tmpNeeded.Clear();
         for (int dz = -activeRange; dz <= activeRange; dz++)
-        {
             for (int dx = -activeRange; dx <= activeRange; dx++)
-            {
                 tmpNeeded.Add(new Vector2Int(pc.x + dx, pc.y + dz));
-            }
-        }
 
-        // 新規生成
         foreach (var key in tmpNeeded)
-            if (!live.ContainsKey(key))
-                CreateChunk(key);
+            if (!live.ContainsKey(key)) CreateChunk(key);
 
-        // 範囲外を削除
         var toRemove = new List<Vector2Int>();
         foreach (var kv in live)
-            if (!tmpNeeded.Contains(kv.Key))
-                toRemove.Add(kv.Key);
-        foreach (var key in toRemove)
-            DestroyChunk(key);
+            if (!tmpNeeded.Contains(kv.Key)) toRemove.Add(kv.Key);
+        foreach (var k in toRemove) DestroyChunk(k);
     }
 
     void CreateChunk(Vector2Int index)
     {
-        // チャンク座標ごとに異なる乱数系列を作成
         int chunkSeed = unchecked(seed + (index.x * 92821) + (index.y * 68917) + (index.x * index.y * 19349663));
-        chunkSeed ^= (int)(Time.realtimeSinceStartup * 1000f) & 0xFFFF;
 
-        // CityChunkBSP を生成
         var chunk = new CityChunkBSP(
             chunkSeed, index, chunkTiles, cellSize,
             wayPrefab, blockPrefab,
@@ -114,89 +96,69 @@ public class InfiniteCityBSPManager : MonoBehaviour
             tilesPerFrame
         );
 
-        // --- 建物プレハブ（単品・配列の両方）を渡す ---
-        chunk.prefab10 = prefab10;
-        chunk.prefab20 = prefab20;
-        chunk.prefab30 = prefab30;
-
+        // --- 建物配列（3枠）だけ渡す ---
         chunk.prefabs50x50 = prefabs50x50;
         chunk.prefabs60x60 = prefabs60x60;
         chunk.prefabs40x60 = prefabs40x60;
 
-        // --- パラメータ転送 ---
-        chunk.buildingPrefabs = buildingPrefabs;
-        chunk.placeLotBaseBlock = placeLotBaseBlock;
-
+        // --- パッキング ---
         chunk.packBuildingsInGrid = packBuildingsInGrid;
         chunk.buildingGridPadding = buildingGridPadding;
         chunk.lotEdgeMargin = lotEdgeMargin;
         chunk.maxBuildingsPerLot = maxBuildingsPerLot;
         chunk.staticCombinePerLot = staticCombinePerLot;
 
+        // --- 道路生成 ---
         chunk.globalArterialPeriod = globalArterialPeriod;
         chunk.globalArterialWidth = globalArterialWidth;
         chunk.minPartitionSize = minPartitionSize;
         chunk.extraCrossChance = extraCrossChance;
         chunk.extraCrossWidth = extraCrossWidth;
 
+        // ✅ 新規：道幅2種を転送
+        chunk.bspRoadWidth = bspRoadWidth;
+        chunk.walkerPathWidth = walkerPathWidth;
+
+        // --- ロット/見た目/地面/NavMesh/スケール ---
         chunk.minLotAreaCells = minLotAreaCells;
         chunk.mergeDiagonals = mergeDiagonals;
-
         chunk.wayTileFillXZ = wayTileFillXZ;
         chunk.wayTileFillY = wayTileFillY;
         chunk.blockFillXZ = blockFillXZ;
         chunk.blockFillY = blockFillY;
-
         chunk.groundMask = groundMask;
         chunk.bakeNavMeshPerChunk = bakeNavMeshPerChunk;
         chunk.agentTypeId = agentTypeId;
         chunk.includeBlocksInNavMesh = includeBlocksInNavMesh;
-
         chunk.globalScale = globalScale;
 
         live[index] = chunk;
-        var co = StartCoroutine(chunk.GenerateAsync());
-        running[index] = co;
+        running[index] = StartCoroutine(chunk.GenerateAsync());
     }
 
     void DestroyChunk(Vector2Int index)
     {
-        if (running.TryGetValue(index, out var co) && co != null)
-        {
-            StopCoroutine(co);
-            running.Remove(index);
-        }
-        if (live.TryGetValue(index, out var chunk))
-        {
-            chunk.Dispose();
-            live.Remove(index);
-        }
+        if (running.TryGetValue(index, out var co) && co != null) { StopCoroutine(co); running.Remove(index); }
+        if (live.TryGetValue(index, out var c)) { c.Dispose(); live.Remove(index); }
     }
 
-    Vector2Int WorldToChunk(Vector3 worldPos)
+    Vector2Int WorldToChunk(Vector3 wp)
     {
         float size = (chunkTiles * cellSize) * Mathf.Max(0.01f, globalScale);
-        int cx = Mathf.FloorToInt(worldPos.x / size);
-        int cz = Mathf.FloorToInt(worldPos.z / size);
-        return new Vector2Int(cx, cz);
+        return new Vector2Int(Mathf.FloorToInt(wp.x / size), Mathf.FloorToInt(wp.z / size));
     }
 
     void OnDrawGizmosSelected()
     {
         if (!Application.isPlaying) return;
         Gizmos.color = new Color(0, 0.5f, 1f, 0.15f);
-
         float size = (chunkTiles * cellSize) * Mathf.Max(0.01f, globalScale);
-        Vector2Int pc = WorldToChunk(player ? player.position : Vector3.zero);
-
+        var pc = WorldToChunk(player ? player.position : Vector3.zero);
         for (int dz = -activeRange; dz <= activeRange; dz++)
-        {
             for (int dx = -activeRange; dx <= activeRange; dx++)
             {
-                var origin = new Vector3((pc.x + dx) * size, 0f, (pc.y + dz) * size);
-                var sz = new Vector3(size, 0f, size);
-                Gizmos.DrawWireCube(origin + new Vector3(sz.x * 0.5f, 0f, sz.z * 0.5f), sz);
+                var o = new Vector3((pc.x + dx) * size, 0f, (pc.y + dz) * size);
+                Gizmos.DrawWireCube(o + new Vector3(size * 0.5f, 0, size * 0.5f), new Vector3(size, 0, size));
             }
-        }
     }
 }
