@@ -29,6 +29,11 @@ public class CityChunkBSP : IDisposable
     [Range(0f, 1f)] public float extraCrossChance = 0.35f;
     [Range(0, 3)] public int extraCrossWidth = 1;
 
+    // ★ 追加：BSPやWalkersの道幅
+    [Header("Road Widths")]
+    [Range(1, 5)] public int bspRoadWidth = 1;      // BSP のローカル道の幅（セル）
+    [Range(1, 5)] public int walkerPathWidth = 1;   // ランダムウォーカーの道幅（セル）
+
     public enum RoadGenMode { BSP, RotatedGrid, RandomWalkers }
     [Header("Road Generation: Mode & Params")]
     public RoadGenMode roadMode = RoadGenMode.BSP;
@@ -43,7 +48,6 @@ public class CityChunkBSP : IDisposable
     [Min(10)] public int walkerMaxSteps = 500;
     [Range(0f, 1f)] public float walkerTurnBias = 0.25f;    // どれくらい曲がりやすいか
     [Range(0f, 1f)] public float walkerJunctionBias = 0.10f; // Wayに接したら分岐しやすい
-
 
     [Header("Lots / Buildings")]
     public bool placeLotBaseBlock = true;
@@ -228,12 +232,14 @@ public class CityChunkBSP : IDisposable
                 CarveH(0, chunkTiles, lz, width);
         }
     }
+
     void CarveRoadsBspStyle()
     {
         var stack = new Stack<RectInt>();
         stack.Push(new RectInt(0, 0, chunkTiles, chunkTiles));
 
         int minSize = (minPartitionSize > 0) ? minPartitionSize : Mathf.Max(6, chunkTiles / 6);
+        int wBsp = Mathf.Clamp(bspRoadWidth, 1, 5); // ★ 追加：幅を取得
 
         while (stack.Count > 0)
         {
@@ -246,9 +252,9 @@ public class CityChunkBSP : IDisposable
             if (!canSplitH && !canSplitV)
             {
                 if (rng.NextDouble() < 0.5 && r.height >= 3)
-                    CarveH(r.xMin, r.xMax, rng.Next(r.yMin + 1, r.yMax - 1), 1);
+                    CarveH(r.xMin, r.xMax, rng.Next(r.yMin + 1, r.yMax - 1), wBsp);  // ← 幅差し替え
                 else if (r.width >= 3)
-                    CarveV(r.yMin, r.yMax, rng.Next(r.xMin + 1, r.xMax - 1), 1);
+                    CarveV(r.yMin, r.yMax, rng.Next(r.xMin + 1, r.xMax - 1), wBsp);  // ← 幅差し替え
                 continue;
             }
 
@@ -256,14 +262,14 @@ public class CityChunkBSP : IDisposable
             if (splitH)
             {
                 int splitZ = rng.Next(r.yMin + minSize, r.yMax - minSize);
-                CarveH(r.xMin, r.xMax, splitZ, 1);
+                CarveH(r.xMin, r.xMax, splitZ, wBsp);                                // ← 幅差し替え
                 stack.Push(new RectInt(r.xMin, r.yMin, r.width, splitZ - r.yMin));
                 stack.Push(new RectInt(r.xMin, splitZ, r.width, r.yMax - splitZ));
             }
             else
             {
                 int splitX = rng.Next(r.xMin + minSize, r.xMax - minSize);
-                CarveV(r.yMin, r.yMax, splitX, 1);
+                CarveV(r.yMin, r.yMax, splitX, wBsp);                                // ← 幅差し替え
                 stack.Push(new RectInt(r.xMin, r.yMin, splitX - r.xMin, r.height));
                 stack.Push(new RectInt(splitX, r.yMin, r.xMax - splitX, r.height));
             }
@@ -276,11 +282,14 @@ public class CityChunkBSP : IDisposable
             int z = rng.Next(1, chunkTiles - 1);
             if (rng.NextDouble() < extraCrossChance)
             {
-                CarveH(Mathf.Max(0, x - extraCrossWidth), Mathf.Min(chunkTiles, x + extraCrossWidth + 1), z, 1);
-                CarveV(Mathf.Max(0, z - extraCrossWidth), Mathf.Min(chunkTiles, z + extraCrossWidth + 1), x, 1);
+                // 交差追加は従来の指定幅（extraCrossWidth）を使用
+                int cw = Mathf.Clamp(extraCrossWidth, 1, 5);
+                CarveH(Mathf.Max(0, x - cw), Mathf.Min(chunkTiles, x + cw + 1), z, cw);
+                CarveV(Mathf.Max(0, z - cw), Mathf.Min(chunkTiles, z + cw + 1), x, cw);
             }
         }
     }
+
 
     void ClearGrid()
     {
@@ -337,6 +346,22 @@ public class CityChunkBSP : IDisposable
     void CarveRandomWalkers()
     {
         var dirs = new Vector2Int[] { new(1, 0), new(-1, 0), new(0, 1), new(0, -1) };
+        int w = Mathf.Clamp(walkerPathWidth, 1, 5);     // ★ 道幅
+        int half = Mathf.Max(0, (w - 1) / 2);
+
+        // 局所関数：太い道を stamp
+        void StampFat(int cx, int cz)
+        {
+            for (int dz = -half; dz <= half; dz++)
+            {
+                for (int dx = -half; dx <= half; dx++)
+                {
+                    int xx = cx + dx;
+                    int zz = cz + dz;
+                    if (InRange(xx, zz)) grid[xx, zz] = CellType.Way;
+                }
+            }
+        }
 
         for (int i = 0; i < walkersCount; i++)
         {
@@ -347,14 +372,15 @@ public class CityChunkBSP : IDisposable
             for (int step = 0; step < walkerMaxSteps; step++)
             {
                 if (!InRange(x, z)) break;
-                grid[x, z] = CellType.Way;
+                StampFat(x, z); // ★ 細道→太道
 
+                // Wayに接したら分岐（太さも適用）
                 if (TouchesWay4(x, z) && rng.NextDouble() < walkerJunctionBias)
                 {
                     int nd = (d + (rng.Next(0, 2) == 0 ? 1 : 3)) & 3;
                     var b = dirs[nd];
                     int bx = x + b.x, bz = z + b.y;
-                    if (InRange(bx, bz)) grid[bx, bz] = CellType.Way;
+                    if (InRange(bx, bz)) StampFat(bx, bz); // ★ 太く分岐
                 }
 
                 if (rng.NextDouble() < walkerTurnBias)
@@ -368,6 +394,7 @@ public class CityChunkBSP : IDisposable
             }
         }
     }
+
     void CarveH(int xMin, int xMax, int z, int width)
     {
         int half = Mathf.Max(0, (width - 1) / 2);
